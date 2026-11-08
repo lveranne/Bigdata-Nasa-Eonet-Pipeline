@@ -1,0 +1,6 @@
+127.0.0.1   localhost
+
+# 3-Node VirtualBox Cluster Network Topology
+192.168.56.10 master
+192.168.56.11 worker
+192.168.56.12 worker2
