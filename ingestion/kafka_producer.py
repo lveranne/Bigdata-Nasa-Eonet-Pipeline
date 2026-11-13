@@ -1,6 +1,7 @@
 import os
 import json
 import time
+from datetime import datetime, timezone
 import requests
 from kafka import KafkaProducer
 
@@ -40,9 +41,13 @@ def fetch_and_produce():
 
         response.raise_for_status()
         events = response.json().get("events", [])
+        ingested_at = datetime.now(timezone.utc).isoformat()
         
         published_count = 0
         for event in events:
+            # Stamp UTC ingestion time 
+            event["ingested_at"] = ingested_at
+            
             # Extract main category for the Kafka key
             categories = event.get("categories", [])
             category_key = categories[0]["id"] if categories else "general"
