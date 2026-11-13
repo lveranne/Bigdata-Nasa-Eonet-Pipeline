@@ -1,79 +1,111 @@
 import os
 import json
 import time
+import logging
 from datetime import datetime, timezone
 import requests
 from kafka import KafkaProducer
+from kafka.errors import NoBrokersAvailable, KafkaError
 
-# 1. NASA API Key (Replace 'DEMO_KEY' with your own free key from api.nasa.gov)
-NASA_API_KEY = os.getenv("NASA_API_KEY", "DEMO_KEY")
-
-# 2. Kafka Producer initialization pointing to the Master Node
-producer = KafkaProducer(
-    bootstrap_servers=['192.168.56.10:9092'],
-    value_serializer=lambda v: json.dumps(v).encode('utf-8'),
-    key_serializer=lambda k: str(k).encode('utf-8')
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
-# NASA EONET v3 Endpoint
+NASA_API_KEY = os.getenv("NASA_API_KEY", "DEMO_KEY")
 EONET_URL = "https://eonet.gsfc.nasa.gov/api/v3/events"
+TOPIC_NAME = "nasa-eonet-raw"
+BOOTSTRAP_SERVERS = [
+    "192.168.56.10:9092",
+    "192.168.56.11:9092",
+    "192.168.56.12:9092"
+]
 
-def fetch_and_produce():
+
+def create_producer_with_backoff():
+    """Connects to the 3-node Kafka cluster with exponential backoff."""
+    delay = 2
+    while True:
+        try:
+            producer = KafkaProducer(
+                bootstrap_servers=BOOTSTRAP_SERVERS,
+                value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+                key_serializer=lambda k: str(k).encode("utf-8"),
+                acks="all",                  # Wait for all in-sync replicas
+                retries=5,                   # Built-in transient send retries
+                retry_backoff_ms=500
+            )
+            logging.info("Connected to Kafka cluster.")
+            return producer
+        except NoBrokersAvailable:
+            logging.warning(f"Kafka brokers unavailable. Retrying in {delay}s...")
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
+
+
+def fetch_and_produce(producer):
     params = {
         "status": "open",
         "limit": 100,
         "api_key": NASA_API_KEY
     }
-    
+
     try:
-        response = requests.get(EONET_URL, params=params, timeout=10)
-        
-        # Inspect HTTP Rate Limit headers
-        remaining = response.headers.get('X-RateLimit-Remaining')
+        response = requests.get(EONET_URL, params=params, timeout=15)
+
+        remaining = response.headers.get("X-RateLimit-Remaining")
         if remaining is not None:
-            print(f"[RateLimit] Remaining requests for this window: {remaining}")
-        
-        # Handle Rate Limit reached (Error 429)
+            logging.info(f"[RateLimit] Requests left in quota: {remaining}")
+
         if response.status_code == 429:
-            print("[WARNING] Rate limit reached (HTTP 429)! Enforcing a 15-minute pause...")
-            time.sleep(900)  # Wait 15 minutes before the next attempt
+            logging.warning("[WARNING] Quota reached (HTTP 429). Pausing for 15 min...")
+            time.sleep(900)
             return
 
         response.raise_for_status()
         events = response.json().get("events", [])
         ingested_at = datetime.now(timezone.utc).isoformat()
-        
+
         published_count = 0
         for event in events:
-            # Stamp UTC ingestion time 
+            # Stamp UTC ingestion time (Step 3)
             event["ingested_at"] = ingested_at
-            
-            # Extract main category for the Kafka key
+
+            # Partition key by hazard category (or use event["id"] for strict per-event order)
             categories = event.get("categories", [])
             category_key = categories[0]["id"] if categories else "general"
-            
-            # Publish to Kafka topic 'nasa-eonet-raw'
+
             producer.send(
-                topic='nasa-eonet-raw',
+                topic=TOPIC_NAME,
                 key=category_key,
                 value=event
             )
             published_count += 1
-            
+
         producer.flush()
-        print(f"[OK] Successfully published {published_count} NASA EONET events to Kafka.")
+        logging.info(f"[OK] {published_count} NASA EONET events published to '{TOPIC_NAME}'.")
 
     except requests.exceptions.RequestException as e:
-        print(f"[API ERROR] Request failed for NASA EONET: {e}")
-    except Exception as e:
-        print(f"[ERROR] Unexpected Producer failure: {e}")
+        logging.error(f"[API Error] EONET request failed: {e}")
+    except KafkaError as e:
+        logging.error(f"[Kafka Error] Failed to publish batch: {e}")
+        raise
+
 
 if __name__ == "__main__":
-    # Adjusted according to DEMO_KEY limits (50 requests/day):
-    # A delay of 1800 seconds (30 mins) = 48 requests per day.
-    POLL_INTERVAL = 1800 if NASA_API_KEY == "DEMO_KEY" else 300  # 5 min for custom API key
-    
-    print(f"Starting NASA Kafka Producer (Key: {NASA_API_KEY}, Interval: {POLL_INTERVAL}s)")
+    POLL_INTERVAL = 1800 if NASA_API_KEY == "DEMO_KEY" else 300
+    logging.info(f"--- Starting Kafka Ingestion (Interval: {POLL_INTERVAL}s) ---")
+
+    producer = create_producer_with_backoff()
+    backoff = 5
+
     while True:
-        fetch_and_produce()
-        time.sleep(POLL_INTERVAL)
+        try:
+            fetch_and_produce(producer)
+            backoff = 5  # Reset backoff on success
+            time.sleep(POLL_INTERVAL)
+        except KafkaError:
+            logging.warning(f"Reconnecting producer in {backoff}s...")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 120)
+            producer = create_producer_with_backoff()
