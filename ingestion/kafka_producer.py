@@ -5,7 +5,7 @@ import logging
 from datetime import datetime, timezone
 import requests
 from kafka import KafkaProducer
-from kafka.errors import NoBrokersAvailable, KafkaError
+from kafka.errors import KafkaError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,7 +23,6 @@ BOOTSTRAP_SERVERS = [
 
 
 def create_producer_with_backoff():
-    """Connects to the 3-node Kafka cluster with exponential backoff."""
     delay = 2
     while True:
         try:
@@ -31,14 +30,14 @@ def create_producer_with_backoff():
                 bootstrap_servers=BOOTSTRAP_SERVERS,
                 value_serializer=lambda v: json.dumps(v).encode("utf-8"),
                 key_serializer=lambda k: str(k).encode("utf-8"),
-                acks="all",                  # Wait for all in-sync replicas
-                retries=5,                   # Built-in transient send retries
+                acks="all",
+                retries=5,
                 retry_backoff_ms=500
             )
-            logging.info("Connected to Kafka cluster.")
+            logging.info("Connected to 3-node Kafka cluster.")
             return producer
-        except NoBrokersAvailable:
-            logging.warning(f"Kafka brokers unavailable. Retrying in {delay}s...")
+        except (KafkaError, Exception) as e:
+            logging.warning(f"Kafka brokers unavailable ({e}). Retrying in {delay}s...")
             time.sleep(delay)
             delay = min(delay * 2, 60)
 
@@ -68,10 +67,7 @@ def fetch_and_produce(producer):
 
         published_count = 0
         for event in events:
-            # Stamp UTC ingestion time (Step 3)
             event["ingested_at"] = ingested_at
-
-            # Partition key by hazard category (or use event["id"] for strict per-event order)
             categories = event.get("categories", [])
             category_key = categories[0]["id"] if categories else "general"
 
@@ -102,10 +98,11 @@ if __name__ == "__main__":
     while True:
         try:
             fetch_and_produce(producer)
-            backoff = 5  # Reset backoff on success
+            backoff = 5
             time.sleep(POLL_INTERVAL)
         except KafkaError:
             logging.warning(f"Reconnecting producer in {backoff}s...")
             time.sleep(backoff)
             backoff = min(backoff * 2, 120)
             producer = create_producer_with_backoff()
+EOF
